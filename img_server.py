@@ -4,9 +4,9 @@ import pickle
 import numpy as np
 
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-ip = "127.0.0.1"
+host = "0.0.0.0"  # listen on all interfaces (accept from 192.168.1.92 etc.)
 port = 6666
-s.bind((ip, port))
+s.bind((host, port))
 
 while True:
     x = s.recvfrom(100000)
