@@ -8,17 +8,20 @@ host = "0.0.0.0"  # listen on all interfaces (accept from 192.168.1.92 etc.)
 port = 6666
 s.bind((host, port))
 
+# Create window once so it appears (required on some setups)
+cv2.namedWindow("Img Server", cv2.WINDOW_NORMAL)
+
 while True:
     x = s.recvfrom(100000)
     clientip = x[1][0]
     data = x[0]
 
     data = pickle.loads(data)
-
     img = cv2.imdecode(data, cv2.IMREAD_COLOR)
-    cv2.imshow("Img Server", img)
 
-    if(cv2.waitKey(5) & 0xFF == 27):
+    if img is not None:
+        cv2.imshow("Img Server", img)
+    if cv2.waitKey(5) & 0xFF == 27:
         break
 
 cv2.destroyAllWindows()
