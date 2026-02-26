@@ -1,6 +1,7 @@
 import socket
 import pickle
 import time
+import numpy as np
 
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -13,22 +14,29 @@ SEND_HZ = 10
 joint_angles = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # e.g. 6-DOF
 
 interval = 1.0 / SEND_HZ if SEND_HZ > 0 else None
+send_count = 0
 
-while True:
-    # TODO: read real joint angles from your hardware/controller
-    # joint_angles = get_joint_angles()
+def get_random_joint_angles():
+    return np.random.uniform(-1, 1, 6).tolist()
 
-    data = pickle.dumps(joint_angles)
-    s.sendto(data, (server_ip, server_port))
+try:
+    while True:
+        joint_angles = get_random_joint_angles()
+        data = pickle.dumps(joint_angles)
+        s.sendto(data, (server_ip, server_port))
+        send_count += 1
+        print("[client] send #{} @ {} Hz: {}".format(send_count, SEND_HZ, [round(a, 4) for a in joint_angles]))
 
-    if interval is not None:
-        time.sleep(interval)
-    else:
-        try:
-            key = input("Enter 'q' to quit, or Enter to send again: ")
-            if key.strip().lower() == "q":
+        if interval is not None:
+            time.sleep(interval)
+        else:
+            try:
+                key = input("Enter 'q' to quit, or Enter to send again: ")
+                if key.strip().lower() == "q":
+                    break
+            except (EOFError, KeyboardInterrupt):
                 break
-        except (EOFError, KeyboardInterrupt):
-            break
-
-s.close()
+except KeyboardInterrupt:
+    print("\n[client] stopped after {} sends".format(send_count))
+finally:
+    s.close()
