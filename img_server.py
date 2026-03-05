@@ -1,67 +1,65 @@
 import cv2
 import socket
 import pickle
+import struct
 import numpy as np
 
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-host = "0.0.0.0"  # listen on all interfaces (accept from 192.168.1.92 etc.)
+
+def recv_exact(sock, n):
+    """Read exactly n bytes from sock."""
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(min(n - len(buf), 65536))
+        if not chunk:
+            break
+        buf += chunk
+    return buf
+
+
+host = "0.0.0.0"
 port = 6666
-s.bind((host, port))
+listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind((host, port))
+listener.listen(1)
 
-# Create window once so it appears (required on some setups)
+print("TCP server listening on {}:{}".format(host, port))
+print("Waiting for client... (Ctrl+C to stop)\n")
+conn, addr = listener.accept()
+listener.close()
+print("Client connected from {}".format(addr[0]))
+
 cv2.namedWindow("Img Server", cv2.WINDOW_NORMAL)
-
-# Max UDP payload ~64KB; larger frames get truncated and decode fails
-RECV_BUF = 65507
 frame_count = 0
 
-print("Server listening on {}:{} (buffer {} bytes)".format(host, port, RECV_BUF))
-print("Waiting for client... (press Ctrl+C to stop)\n")
-
-while True:
-    try:
-        x = s.recvfrom(RECV_BUF)
-    except Exception as e:
-        print("recvfrom error:", e)
-        continue
-    clientip = x[1][0]
-    data = x[0]
-    n_bytes = len(data)
-    frame_count += 1
-
-    if n_bytes == 0:
-        print("[frame {}] empty packet from {}".format(frame_count, clientip))
-        if cv2.waitKey(5) & 0xFF == 27:
+try:
+    while True:
+        # Length-prefixed: 4-byte big-endian size then payload
+        len_buf = recv_exact(conn, 4)
+        if len(len_buf) != 4:
             break
-        continue
-
-    print("[frame {}] received {} bytes from {}".format(frame_count, n_bytes, clientip), end="")
-
-    try:
-        data = pickle.loads(data)
-    except Exception as e:
-        print(" -> pickle.loads FAILED:", e)
-        if cv2.waitKey(5) & 0xFF == 27:
+        n_bytes = struct.unpack(">I", len_buf)[0]
+        if n_bytes <= 0 or n_bytes > 50 * 1024 * 1024:  # sanity: max 50MB
             break
-        continue
-
-    if not isinstance(data, np.ndarray):
-        print(" -> decoded data is not ndarray: type={}".format(type(data)))
-        if cv2.waitKey(5) & 0xFF == 27:
+        data = recv_exact(conn, n_bytes)
+        if len(data) != n_bytes:
             break
-        continue
+        frame_count += 1
 
-    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
-    if img is None:
-        print(" -> imdecode FAILED (truncated/corrupt? {} bytes payload)".format(len(data) if hasattr(data, '__len__') else '?'))
-        if n_bytes >= RECV_BUF:
-            print("     (hint: payload may be truncated - UDP max ~64KB, use smaller resolution or TCP)")
-    else:
-        print(" -> ok shape={}".format(img.shape))
-        cv2.imshow("Img Server", img)
-
-    if cv2.waitKey(5) & 0xFF == 27:
-        break
-
-cv2.destroyAllWindows()
-s.close()
+        try:
+            buffer = pickle.loads(data)
+        except Exception:
+            continue
+        if not isinstance(buffer, np.ndarray):
+            continue
+        img = cv2.imdecode(buffer, cv2.IMREAD_COLOR)
+        if img is not None:
+            cv2.imshow("Img Server", img)
+        if cv2.waitKey(1) & 0xFF == 27:
+            break
+except (ConnectionResetError, BrokenPipeError):
+    pass
+finally:
+    conn.close()
+    cv2.destroyAllWindows()
+    print("Stopped after {} frames".format(frame_count))
