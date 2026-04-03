@@ -7,7 +7,7 @@ import time
 # - Resolution kept small so each JPEG is more likely to fit into one UDP packet.
 # - Frame validation prevents calling imshow/imencode with empty frames.
 
-server_ip = "192.168.1.98"  # <-- set to the server PC IP (Windows laptop)
+server_ip = "192.168.1.92"  # <-- set to the server PC IP (Windows laptop)
 server_port = 6666
 
 SOCKET_BUF_SIZE = 2 * 1024 * 1024  # 2MB
