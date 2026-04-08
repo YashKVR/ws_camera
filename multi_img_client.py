@@ -46,11 +46,13 @@ V4L2_CAP_VIDEO_CAPTURE = 0x00000001
 #   MULTI_CAM_MAX=3                            — max viewports after duplicate removal (default 2; two USB cams is typical)
 #   MULTI_CAM_SKIP_DEDUPE=1                    — skip duplicate-feed merge (use if Pi still hangs)
 #   MULTI_CAM_DEDUPE_MEAN / MULTI_CAM_DEDUPE_STD — tune duplicate detection (default 6 / 5)
+#   MULTI_CAM_DEDUPE_MSE=18                       — fingerprint distance threshold (lower = stricter duplicate match)
 #   MULTI_CAM_JPEG_QUALITY=20                    — JPEG quality when 2+ cameras (smaller = less lag)
 #   MULTI_CAM_USB_SAFE=1                         — force tiny res + low FPS (3+ USB cams / "No space left on device")
 #   MULTI_CAM_TARGET_FPS=10                      — override FPS cap for 2+ cameras
 #   MULTI_CAM_GRAB_FLUSH=2                       — same for all cams (default 2; try 1 if CPU-bound)
 #   MULTI_CAM_PI_MODE=1                          — force Pi-friendly defaults (auto-enabled on ARM Linux if unset)
+#   MULTI_CAM_FORCE_INDEX_PROBE=1                — use OpenCV index probe (legacy fallback)
 
 
 def _truthy_env(name: str) -> bool:
@@ -208,6 +210,18 @@ def build_candidate_devices():
         return cands
 
     if sys.platform.startswith("linux"):
+        force_indices = _truthy_env("MULTI_CAM_FORCE_INDEX_PROBE")
+        # Prefer concrete /dev/video paths on Linux: much better duplicate filtering because
+        # we can map each path to a physical sysfs device key in probe_devices().
+        if not force_indices:
+            for p in parse_v4l2ctl_list_devices():
+                if has_v4l2_video_capture(p):
+                    add(p)
+            for p in list_glob_video_nodes():
+                add(p)
+            if cands:
+                return cands
+        # Fallback: OpenCV integer indices (legacy behavior).
         for i in range(OPENCV_MAX_CAMERA_INDEX):
             add(i)
         if os.environ.get("MULTI_CAM_PROBE_PATHS", "").strip() in ("1", "true", "yes"):
@@ -351,7 +365,7 @@ def probe_devices():
 def _capture_light_signature(dev):
     """
     One camera open at a time (Pi USB stack often hangs if two VideoCaptures read
-    at once). Returns (mean, std) of a small grayscale frame or None.
+    at once). Returns (mean, std, fingerprint32x32_float) or None.
     """
     cap = open_capture(dev)
     if not cap.isOpened():
@@ -376,7 +390,15 @@ def _capture_light_signature(dev):
     small = cv2.resize(img, (48, 48))
     if len(small.shape) == 3:
         small = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-    return float(np.mean(small)), float(np.std(small))
+    mean_v = float(np.mean(small))
+    std_v = float(np.std(small))
+    # Robust visual fingerprint: normalize brightness/contrast, then compare MSE.
+    fp = cv2.resize(small, (32, 32)).astype(np.float32)
+    fp = fp - float(np.mean(fp))
+    fp_std = float(np.std(fp))
+    if fp_std > 1e-6:
+        fp = fp / fp_std
+    return mean_v, std_v, fp
 
 
 def same_camera_feed(dev_a, dev_b):
@@ -391,9 +413,14 @@ def same_camera_feed(dev_a, dev_b):
     try:
         dm = float(os.environ.get("MULTI_CAM_DEDUPE_MEAN", "6"))
         ds = float(os.environ.get("MULTI_CAM_DEDUPE_STD", "5"))
+        mse_thr = float(os.environ.get("MULTI_CAM_DEDUPE_MSE", "18"))
     except ValueError:
-        dm, ds = 6.0, 5.0
-    return abs(sa[0] - sb[0]) < dm and abs(sa[1] - sb[1]) < ds
+        dm, ds, mse_thr = 6.0, 5.0, 18.0
+    if not (abs(sa[0] - sb[0]) < dm and abs(sa[1] - sb[1]) < ds):
+        return False
+    # If global luminance/contrast are close, verify image structure is also close.
+    mse = float(np.mean((sa[2] - sb[2]) ** 2))
+    return mse < mse_thr
 
 
 def dedupe_duplicate_feeds(found):
@@ -430,7 +457,7 @@ def sort_camera_devices(devices):
 
 def cap_max_cameras(devices):
     try:
-        m = int(os.environ.get("MULTI_CAM_MAX", "2"))
+        m = int(os.environ.get("MULTI_CAM_MAX", "3"))
     except ValueError:
         m = 2
     if m < 1:
@@ -555,10 +582,8 @@ def placeholder_frame(width, height, label):
 
 def main():
     if sys.platform.startswith("linux") and not os.environ.get("MULTI_CAM_DEVICES"):
-        print("Tip: Two USB webcams — use  MULTI_CAM_DEVICES=0,1  (default MULTI_CAM_MAX=2 avoids a phantom 3rd stream).")
-        print("     OpenCV indices are not /dev/videoN; probe uses 0–{} unless MULTI_CAM_DEVICES is set.".format(
-            OPENCV_MAX_CAMERA_INDEX - 1
-        ))
+        print("Tip: for stable mapping and no duplicates, set MULTI_CAM_DEVICES=/dev/video0,/dev/video2 (or your actual nodes).")
+        print("     Auto-probe on Linux now prefers /dev/video* paths; use MULTI_CAM_FORCE_INDEX_PROBE=1 for legacy index probe.")
 
     devices = probe_devices()
     devices = dedupe_duplicate_feeds(devices)
