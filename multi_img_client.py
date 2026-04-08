@@ -20,16 +20,20 @@ SOCKET_BUF_SIZE = 2 * 1024 * 1024
 
 # Each camera runs in its own thread; the main thread only calls imshow/waitKey.
 WARMUP_READS = 8
+PROBE_READS = 4
 THREAD_START_DELAY_S = 0.25
-MAX_INDEX_PROBE = 16
+# OpenCV camera index (0..N-1), NOT the same as /dev/videoN on Linux.
+OPENCV_MAX_CAMERA_INDEX = 8
 
 # Linux videodev2.h — sysfs device_caps uses this bit for real capture devices.
 V4L2_CAP_VIDEO_CAPTURE = 0x00000001
 
 # Raspberry Pi / OpenCV overrides (optional):
-#   MULTI_CAM_DEVICES=/dev/video0,/dev/video11   — force this probe order only
-#   MULTI_CAM_SKIP_CAPS_FILTER=1                 — do not filter by device_caps (debug)
-#   MULTI_CAM_NO_MJPEG=1                         — never set MJPEG (some CSI / bridges)
+#   MULTI_CAM_DEVICES=0,1                        — OpenCV indices (recommended on Pi)
+#   MULTI_CAM_DEVICES=/dev/video0                — device paths (path-only open, no /dev/videoN→N fallback)
+#   MULTI_CAM_PROBE_PATHS=1                    — also try v4l2 paths (slower; can spam warnings)
+#   MULTI_CAM_SKIP_CAPS_FILTER=1               — do not filter by device_caps (debug)
+#   MULTI_CAM_NO_MJPEG=1                       — never set MJPEG (some CSI / bridges)
 
 
 def pick_frame_size(num_cameras):
@@ -102,7 +106,9 @@ def list_glob_video_nodes():
 
 def build_candidate_devices():
     """
-    Ordered list of device paths (str) or indices (int) to try.
+    OpenCV uses its own camera index (0,1,2,…). That is NOT the same as /dev/video10 —
+    VideoCapture(10) asks for the 11th OpenCV camera, which fails when only ~4 exist.
+    Default: probe small integer indices only. Optional path list must not map videoN→N.
     """
     cands = []
     seen = set()
@@ -127,13 +133,14 @@ def build_candidate_devices():
         return cands
 
     if sys.platform.startswith("linux"):
-        for p in parse_v4l2ctl_list_devices():
-            if has_v4l2_video_capture(p):
-                add(p)
-        for p in list_glob_video_nodes():
-            add(p)
-        for i in range(MAX_INDEX_PROBE):
+        for i in range(OPENCV_MAX_CAMERA_INDEX):
             add(i)
+        if os.environ.get("MULTI_CAM_PROBE_PATHS", "").strip() in ("1", "true", "yes"):
+            for p in parse_v4l2ctl_list_devices():
+                if has_v4l2_video_capture(p):
+                    add(p)
+            for p in list_glob_video_nodes():
+                add(p)
     else:
         for i in range(8):
             add(i)
@@ -156,17 +163,10 @@ def get_v4l2_physical_device_key(dev):
     return None
 
 
-def _video_index(dev):
-    if isinstance(dev, int):
-        return dev
-    m = re.search(r"video(\d+)$", dev) if isinstance(dev, str) else None
-    return int(m.group(1)) if m else None
-
-
 def open_capture(dev):
     """
-    Open by path or index. On Raspberry Pi, path + CAP_V4L2 often fails
-    ('can't be used to capture by name'); fall back to numeric index.
+    Integer dev = OpenCV camera index (0,1,2,…). Do not confuse with /dev/videoN.
+    String dev = open that device node only (never fall back to VideoCapture(N) from path).
     """
     if isinstance(dev, int):
         if sys.platform.startswith("linux"):
@@ -186,16 +186,6 @@ def open_capture(dev):
         if cap.isOpened():
             return cap
         cap.release()
-        idx = _video_index(dev)
-        if idx is not None:
-            cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
-            if cap.isOpened():
-                return cap
-            cap.release()
-            cap = cv2.VideoCapture(idx)
-            if cap.isOpened():
-                return cap
-            cap.release()
 
     return cv2.VideoCapture(dev)
 
@@ -206,6 +196,22 @@ def read_valid_frame(cap):
         return False
     h, w = img.shape[:2]
     return w > 2 and h > 2
+
+
+def read_valid_frame_timeout(cap, timeout_sec=1.25):
+    """Avoid hanging forever on cap.read() during probe (bad device)."""
+    result = [None]
+
+    def _read():
+        result[0] = read_valid_frame(cap)
+
+    th = threading.Thread(target=_read)
+    th.daemon = True
+    th.start()
+    th.join(timeout_sec)
+    if th.is_alive():
+        return False
+    return bool(result[0])
 
 
 def probe_devices():
@@ -221,17 +227,25 @@ def probe_devices():
             cap.release()
             continue
 
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+
         ok = False
-        for _ in range(WARMUP_READS):
-            if read_valid_frame(cap):
+        for _ in range(PROBE_READS):
+            if read_valid_frame_timeout(cap):
                 ok = True
                 break
         if not ok:
             cap.release()
             continue
 
-        phys = get_v4l2_physical_device_key(dev)
-        key = phys if phys is not None else as_dev_path(dev)
+        if isinstance(dev, int):
+            key = ("opencv", dev)
+        else:
+            phys = get_v4l2_physical_device_key(dev)
+            key = phys if phys is not None else dev
         if key in seen_physical:
             cap.release()
             continue
@@ -301,7 +315,7 @@ def capture_loop(
 
 def window_title(dev):
     if isinstance(dev, int):
-        return "video{}".format(dev)
+        return "cam{}".format(dev)
     return os.path.basename(dev)
 
 
@@ -322,8 +336,10 @@ def placeholder_frame(width, height, label):
 
 def main():
     if sys.platform.startswith("linux") and not os.environ.get("MULTI_CAM_DEVICES"):
-        print("Tip: if no cameras found, run: v4l2-ctl --list-devices")
-        print("     or set MULTI_CAM_DEVICES=/dev/video0  (comma-separated)")
+        print("Tip: OpenCV uses cam index 0,1,2… (not /dev/videoN). Try: MULTI_CAM_DEVICES=0,1")
+        print("     v4l2-ctl --list-devices shows kernel nodes; default probe is indices 0–{}.".format(
+            OPENCV_MAX_CAMERA_INDEX - 1
+        ))
 
     devices = probe_devices()
     if not devices:
