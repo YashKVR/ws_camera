@@ -16,14 +16,22 @@ SERVER_IP = "192.168.1.92"
 SERVER_PORT = 6668
 STREAM_UDP = True
 JPEG_QUALITY = 25
+# Slightly lower quality when several streams share USB / CPU (smaller UDP packets).
+JPEG_QUALITY_MULTI = 20
 SOCKET_BUF_SIZE = 2 * 1024 * 1024
+# Cap FPS when multiple cameras share USB (lower = less bandwidth, less backlog lag).
+# Overridable via MULTI_CAM_TARGET_FPS when 2+ cameras.
+# grab() depth: MUST be the same for every camera or cam0 and cam1 get different frame times.
+# Override with MULTI_CAM_GRAB_FLUSH (integer >= 1). Default 2 is a balance of freshness vs work per loop.
+GRAB_FLUSH_MULTI_DEFAULT = 2
 
 # Each camera runs in its own thread; the main thread only calls imshow/waitKey.
 WARMUP_READS = 8
 PROBE_READS = 4
 THREAD_START_DELAY_S = 0.25
 # OpenCV camera index (0..N-1), NOT the same as /dev/videoN on Linux.
-OPENCV_MAX_CAMERA_INDEX = 8
+# Pi often reports ~4 logical cameras; probing 0..3 reduces junk indices.
+OPENCV_MAX_CAMERA_INDEX = 4
 
 # Linux videodev2.h — sysfs device_caps uses this bit for real capture devices.
 V4L2_CAP_VIDEO_CAPTURE = 0x00000001
@@ -34,12 +42,54 @@ V4L2_CAP_VIDEO_CAPTURE = 0x00000001
 #   MULTI_CAM_PROBE_PATHS=1                    — also try v4l2 paths (slower; can spam warnings)
 #   MULTI_CAM_SKIP_CAPS_FILTER=1               — do not filter by device_caps (debug)
 #   MULTI_CAM_NO_MJPEG=1                       — never set MJPEG (some CSI / bridges)
+#   MULTI_CAM_MAX=3                            — max viewports after duplicate removal (default 2; two USB cams is typical)
+#   MULTI_CAM_SKIP_DEDUPE=1                    — skip duplicate-feed merge (use if Pi still hangs)
+#   MULTI_CAM_DEDUPE_MEAN / MULTI_CAM_DEDUPE_STD — tune duplicate detection (default 6 / 5)
+#   MULTI_CAM_JPEG_QUALITY=20                    — JPEG quality when 2+ cameras (smaller = less lag)
+#   MULTI_CAM_USB_SAFE=1                         — force tiny res + low FPS (3+ USB cams / "No space left on device")
+#   MULTI_CAM_TARGET_FPS=10                      — override FPS cap for 2+ cameras
+#   MULTI_CAM_GRAB_FLUSH=2                       — same for all cams (default 2; try 1 if CPU-bound)
 
 
 def pick_frame_size(num_cameras):
+    """
+    USB UVC isochronous bandwidth is limited. Three streams at 320x240 MJPEG often hits
+    VIDIOC_STREAMON: No space left on device — scale down when more cameras are used.
+    """
+    if os.environ.get("MULTI_CAM_USB_SAFE", "").strip() in ("1", "true", "yes"):
+        return 160, 120
     if num_cameras <= 1:
         return 640, 480
-    return 320, 240
+    if num_cameras == 2:
+        return 320, 240
+    # 3+ simultaneous UVC streams on one controller
+    return 256, 144
+
+
+def target_fps_for_multi(num_cameras):
+    if num_cameras <= 1:
+        return None
+    raw = os.environ.get("MULTI_CAM_TARGET_FPS", "").strip()
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    if num_cameras == 2:
+        return 12.0
+    if num_cameras == 3:
+        return 8.0
+    return 6.0
+
+
+def default_jpeg_quality_multi(num_cameras):
+    try:
+        return int(os.environ.get("MULTI_CAM_JPEG_QUALITY", str(JPEG_QUALITY_MULTI)))
+    except ValueError:
+        pass
+    if num_cameras >= 3:
+        return min(JPEG_QUALITY_MULTI, 17)
+    return JPEG_QUALITY_MULTI
 
 
 def as_dev_path(dev):
@@ -214,6 +264,22 @@ def read_valid_frame_timeout(cap, timeout_sec=1.25):
     return bool(result[0])
 
 
+def read_frame_any_timeout(cap, timeout_sec=2.0):
+    """Return (ret, img) from cap.read() or (False, None) on timeout."""
+    result = [False, None]
+
+    def _read():
+        result[0], result[1] = cap.read()
+
+    th = threading.Thread(target=_read)
+    th.daemon = True
+    th.start()
+    th.join(timeout_sec)
+    if th.is_alive():
+        return False, None
+    return result[0], result[1]
+
+
 def probe_devices():
     found = []
     seen_physical = set()
@@ -257,16 +323,132 @@ def probe_devices():
     return found
 
 
+def _capture_light_signature(dev):
+    """
+    One camera open at a time (Pi USB stack often hangs if two VideoCaptures read
+    at once). Returns (mean, std) of a small grayscale frame or None.
+    """
+    cap = open_capture(dev)
+    if not cap.isOpened():
+        try:
+            cap.release()
+        except Exception:
+            pass
+        return None
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
+    for _ in range(2):
+        read_frame_any_timeout(cap, 1.5)
+    ret, img = read_frame_any_timeout(cap, 4.0)
+    try:
+        cap.release()
+    except Exception:
+        pass
+    if not ret or img is None or getattr(img, "size", 0) == 0:
+        return None
+    small = cv2.resize(img, (48, 48))
+    if len(small.shape) == 3:
+        small = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    return float(np.mean(small)), float(np.std(small))
+
+
+def same_camera_feed(dev_a, dev_b):
+    """
+    True if two indices likely show the same physical stream (driver duplicates).
+    Opens devices one after another — never two live captures on Pi at once.
+    """
+    sa = _capture_light_signature(dev_a)
+    sb = _capture_light_signature(dev_b)
+    if sa is None or sb is None:
+        return False
+    try:
+        dm = float(os.environ.get("MULTI_CAM_DEDUPE_MEAN", "6"))
+        ds = float(os.environ.get("MULTI_CAM_DEDUPE_STD", "5"))
+    except ValueError:
+        dm, ds = 6.0, 5.0
+    return abs(sa[0] - sb[0]) < dm and abs(sa[1] - sb[1]) < ds
+
+
+def dedupe_duplicate_feeds(found):
+    """
+    Several OpenCV indices can map to the same physical camera (driver repeats the
+    stream). Keep first index in order, drop later duplicates.
+    """
+    if not found or os.environ.get("MULTI_CAM_SKIP_DEDUPE", "").strip() in ("1", "true", "yes"):
+        return found
+    keep = [found[0]]
+    for dev in found[1:]:
+        is_dup = False
+        for k in keep:
+            if same_camera_feed(dev, k):
+                print(
+                    "Skipping duplicate feed {} (same picture as {}).".format(
+                        dev if isinstance(dev, str) else "cam {}".format(dev),
+                        k if isinstance(k, str) else "cam {}".format(k),
+                    )
+                )
+                is_dup = True
+                break
+        if not is_dup:
+            keep.append(dev)
+    return keep
+
+
+def sort_camera_devices(devices):
+    """Prefer lower OpenCV indices first (0,1 before 3) so MULTI_CAM_MAX=2 keeps real webcams."""
+    ints = sorted([d for d in devices if isinstance(d, int)], key=lambda x: x)
+    strs = [d for d in devices if isinstance(d, str)]
+    return ints + strs
+
+
+def cap_max_cameras(devices):
+    try:
+        m = int(os.environ.get("MULTI_CAM_MAX", "2"))
+    except ValueError:
+        m = 2
+    if m < 1:
+        m = 2
+    return devices[:m], m
+
+
+def grab_flush_depth(num_cameras):
+    """Same value for every stream so latency matches across cam0, cam1, cam2."""
+    if num_cameras <= 1:
+        return 1
+    raw = os.environ.get("MULTI_CAM_GRAB_FLUSH", "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return GRAB_FLUSH_MULTI_DEFAULT
+
+
 def prefer_mjpeg_default():
     return os.environ.get("MULTI_CAM_NO_MJPEG", "").strip() not in ("1", "true", "yes")
 
 
-def configure_capture(cap, width, height, prefer_mjpeg=True):
+def configure_capture(cap, width, height, prefer_mjpeg=True, target_fps=None):
     if prefer_mjpeg:
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    if target_fps is not None:
+        cap.set(cv2.CAP_PROP_FPS, target_fps)
+
+
+def retrieve_latest_frame(cap, flush_depth):
+    """
+    Drop queued frames in the driver (grab without decode), then decode the newest.
+    Cuts perceived lag on the 2nd USB camera when buffers pile up.
+    """
+    for _ in range(max(0, flush_depth)):
+        if not cap.grab():
+            return False, None
+    return cap.retrieve()
 
 
 def capture_loop(
@@ -280,16 +462,25 @@ def capture_loop(
     sock=None,
     server_addr=None,
     stream_udp=False,
+    stream_index=0,
+    multi_stream=False,
+    target_fps=None,
+    grab_flush_depth=1,
+    num_cameras=1,
 ):
     label = window_title(dev)
     cap = open_capture(dev)
     if not cap.isOpened():
         print("Thread {}: could not open {}".format(label, dev))
         return
-    configure_capture(cap, width, height, prefer_mjpeg=prefer_mjpeg)
+    configure_capture(cap, width, height, prefer_mjpeg=prefer_mjpeg, target_fps=target_fps if multi_stream else None)
+
+    jpeg_q = JPEG_QUALITY
+    if multi_stream:
+        jpeg_q = default_jpeg_quality_multi(num_cameras)
 
     while not stop_event.is_set():
-        ret, img = cap.read()
+        ret, img = retrieve_latest_frame(cap, grab_flush_depth)
         if not ret or img is None or getattr(img, "size", 0) == 0:
             continue
         with lock:
@@ -299,7 +490,7 @@ def capture_loop(
             ok, buffer = cv2.imencode(
                 ".jpg",
                 img,
-                [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY],
+                [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_q],
             )
             if ok:
                 tag = window_title(dev)
@@ -336,20 +527,45 @@ def placeholder_frame(width, height, label):
 
 def main():
     if sys.platform.startswith("linux") and not os.environ.get("MULTI_CAM_DEVICES"):
-        print("Tip: OpenCV uses cam index 0,1,2… (not /dev/videoN). Try: MULTI_CAM_DEVICES=0,1")
-        print("     v4l2-ctl --list-devices shows kernel nodes; default probe is indices 0–{}.".format(
+        print("Tip: Two USB webcams — use  MULTI_CAM_DEVICES=0,1  (default MULTI_CAM_MAX=2 avoids a phantom 3rd stream).")
+        print("     OpenCV indices are not /dev/videoN; probe uses 0–{} unless MULTI_CAM_DEVICES is set.".format(
             OPENCV_MAX_CAMERA_INDEX - 1
         ))
 
     devices = probe_devices()
+    devices = dedupe_duplicate_feeds(devices)
+    devices = sort_camera_devices(devices)
+    n_after_dedupe = len(devices)
+    devices, cam_limit = cap_max_cameras(devices)
+    if n_after_dedupe > len(devices):
+        print(
+            "Note: using {} of {} detected device(s) (MULTI_CAM_MAX={}). "
+            "Probe can list extra indices (e.g. 0,1,3) for one physical camera — third stream often fails with 'No space left'.".format(
+                len(devices),
+                n_after_dedupe,
+                cam_limit,
+            )
+        )
     if not devices:
         print("Error: No working V4L2 capture devices found.")
         print("Try: MULTI_CAM_SKIP_CAPS_FILTER=1 uv run multi_img_client.py")
         raise SystemExit(1)
 
-    width, height = pick_frame_size(len(devices))
+    ncam = len(devices)
+    width, height = pick_frame_size(ncam)
     pmj = prefer_mjpeg_default()
-    print("Using {}x{} for {} camera(s), MJPEG={}:".format(width, height, len(devices), pmj))
+    tfps = target_fps_for_multi(ncam) if ncam > 1 else None
+    grab_d = grab_flush_depth(ncam)
+    print(
+        "Using {}x{} @ {} fps, grab_flush={} for {} camera(s), MJPEG={} (USB: use different ports/hubs if lag).".format(
+            width,
+            height,
+            tfps if tfps is not None else "default",
+            grab_d if ncam > 1 else 1,
+            ncam,
+            pmj,
+        )
+    )
     for d in devices:
         print("  ", d if isinstance(d, str) else "index {}".format(d))
     print("Press Esc in any window to quit.")
@@ -367,7 +583,8 @@ def main():
     threads = []
     multi = len(devices) > 1
 
-    for dev in devices:
+    for stream_index, dev in enumerate(devices):
+        per_cam_grab = grab_d if multi else 1
         t = threading.Thread(
             target=capture_loop,
             args=(
@@ -381,12 +598,17 @@ def main():
                 sock,
                 server_addr,
                 STREAM_UDP,
+                stream_index,
+                multi,
+                tfps,
+                per_cam_grab,
+                ncam,
             ),
             daemon=True,
         )
         t.start()
         threads.append(t)
-        time.sleep(THREAD_START_DELAY_S)
+        time.sleep(THREAD_START_DELAY_S if ncam <= 2 else 0.55)
 
     last_shown = {}
     try:
