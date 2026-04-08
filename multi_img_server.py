@@ -5,7 +5,7 @@ import numpy as np
 
 # Must match multi_img_client.py (UDP label + pickled JPEG buffer).
 host = "0.0.0.0"
-port = 6667
+port = 6668
 RECV_BUF = 65507
 SOCKET_BUF_SIZE = 2 * 1024 * 1024
 

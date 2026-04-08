@@ -12,7 +12,7 @@ import numpy as np
 
 # Stream to multi_img_server.py on the viewing PC (UDP + per-camera label).
 SERVER_IP = "192.168.1.92"
-SERVER_PORT = 6667
+SERVER_PORT = 6668
 STREAM_UDP = True
 JPEG_QUALITY = 25
 SOCKET_BUF_SIZE = 2 * 1024 * 1024
