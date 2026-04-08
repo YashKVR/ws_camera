@@ -1,5 +1,6 @@
 import glob
 import os
+import platform
 import pickle
 import re
 import socket
@@ -49,6 +50,24 @@ V4L2_CAP_VIDEO_CAPTURE = 0x00000001
 #   MULTI_CAM_USB_SAFE=1                         — force tiny res + low FPS (3+ USB cams / "No space left on device")
 #   MULTI_CAM_TARGET_FPS=10                      — override FPS cap for 2+ cameras
 #   MULTI_CAM_GRAB_FLUSH=2                       — same for all cams (default 2; try 1 if CPU-bound)
+#   MULTI_CAM_PI_MODE=1                          — force Pi-friendly defaults (auto-enabled on ARM Linux if unset)
+
+
+def _truthy_env(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def pi_mode_enabled() -> bool:
+    """
+    On Raspberry Pi (and other ARM Linux SBCs), CPU and USB bandwidth are tighter.
+    Default to more conservative capture/encode settings unless user overrides.
+    """
+    if "MULTI_CAM_PI_MODE" in os.environ:
+        return _truthy_env("MULTI_CAM_PI_MODE")
+    if not sys.platform.startswith("linux"):
+        return False
+    mach = platform.machine().lower()
+    return ("arm" in mach) or ("aarch64" in mach)
 
 
 def pick_frame_size(num_cameras):
@@ -61,6 +80,9 @@ def pick_frame_size(num_cameras):
     if num_cameras <= 1:
         return 640, 480
     if num_cameras == 2:
+        if pi_mode_enabled():
+            # Keep USB + JPEG encode light on Pi; you can override with MULTI_CAM_USB_SAFE=0 and/or set your own camera props.
+            return 320, 240
         return 320, 240
     # 3+ simultaneous UVC streams on one controller
     return 256, 144
@@ -76,9 +98,9 @@ def target_fps_for_multi(num_cameras):
         except ValueError:
             pass
     if num_cameras == 2:
-        return 12.0
+        return 8.0 if pi_mode_enabled() else 12.0
     if num_cameras == 3:
-        return 8.0
+        return 6.0 if pi_mode_enabled() else 8.0
     return 6.0
 
 
@@ -87,6 +109,9 @@ def default_jpeg_quality_multi(num_cameras):
         return int(os.environ.get("MULTI_CAM_JPEG_QUALITY", str(JPEG_QUALITY_MULTI)))
     except ValueError:
         pass
+    if pi_mode_enabled() and num_cameras >= 2:
+        # Lower quality = smaller packets and less work on the Pi.
+        return min(JPEG_QUALITY_MULTI, 15)
     if num_cameras >= 3:
         return min(JPEG_QUALITY_MULTI, 17)
     return JPEG_QUALITY_MULTI
@@ -423,6 +448,9 @@ def grab_flush_depth(num_cameras):
             return max(1, int(raw))
         except ValueError:
             pass
+    # On Pi, grabbing too many frames can become CPU-expensive; prefer a moderate default.
+    if pi_mode_enabled():
+        return 2
     return GRAB_FLUSH_MULTI_DEFAULT
 
 
@@ -594,7 +622,8 @@ def main():
                 lock,
                 width,
                 height,
-                pmj and (not multi),
+                # IMPORTANT: keep MJPEG enabled in multi mode too (huge CPU/USB win on Pi for UVC cams).
+                pmj,
                 sock,
                 server_addr,
                 STREAM_UDP,
