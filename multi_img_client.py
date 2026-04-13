@@ -14,12 +14,7 @@ import numpy as np
 SERVER_IP = "192.168.1.92"
 SERVER_PORT = 6668
 STREAM_UDP = True
-# Target JPEG quality (0–100). May be lowered per-frame so the UDP datagram fits.
-JPEG_QUALITY = 85
-JPEG_QUALITY_MIN = 15
-JPEG_QUALITY_STEP = 10
-# Must match multi_img_server.py RECV_BUF (single datagram, includes pickle overhead).
-MAX_UDP_DATAGRAM = 65507
+JPEG_QUALITY = 25
 SOCKET_BUF_SIZE = 2 * 1024 * 1024
 
 # Each camera runs in its own thread; the main thread only calls imshow/waitKey.
@@ -30,8 +25,8 @@ THREAD_START_DELAY_S = 0.25
 def pick_frame_size(num_cameras):
     """Smaller frames when multiple UVC streams share USB bandwidth."""
     if num_cameras <= 1:
-        return 1280, 720
-    return 640, 480
+        return 640, 480
+    return 320, 240
 
 
 def list_v4l2_device_nodes():
@@ -148,43 +143,6 @@ def configure_capture(cap, width, height, prefer_mjpeg=True):
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
 
-def packetize_jpeg_for_udp(img, tag):
-    """
-    Build the legacy UDP payload: label header + pickle(imencode buffer).
-    Lowers JPEG quality and, if needed, downscales *img* until the datagram
-    fits MAX_UDP_DATAGRAM (avoids truncation on the receiver).
-    """
-    b = tag.encode("utf-8")
-    if len(b) > 255:
-        b = b[:255]
-    header = struct.pack("!B", len(b)) + b
-    max_payload = MAX_UDP_DATAGRAM - len(header)
-
-    work = img
-    max_shrink_rounds = 6
-    for _ in range(max_shrink_rounds + 1):
-        q = JPEG_QUALITY
-        while q >= JPEG_QUALITY_MIN:
-            ok, buffer = cv2.imencode(
-                ".jpg",
-                work,
-                [int(cv2.IMWRITE_JPEG_QUALITY), q],
-            )
-            if not ok:
-                return None
-            payload = pickle.dumps(buffer)
-            if len(payload) <= max_payload:
-                return header + payload
-            q -= JPEG_QUALITY_STEP
-        h, w = work.shape[:2]
-        if w <= 160 or h <= 120:
-            return None
-        nw = max(160, int(w * 0.85))
-        nh = max(120, int(h * 0.85))
-        work = cv2.resize(work, (nw, nh), interpolation=cv2.INTER_AREA)
-    return None
-
-
 def capture_loop(
     dev_path,
     stop_event,
@@ -212,10 +170,19 @@ def capture_loop(
             frames[dev_path] = img.copy()
 
         if stream_udp and sock is not None and server_addr is not None:
-            tag = window_title(dev_path)
-            packet = packetize_jpeg_for_udp(img, tag)
-            if packet is not None:
-                sock.sendto(packet, server_addr)
+            ok, buffer = cv2.imencode(
+                ".jpg",
+                img,
+                [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY],
+            )
+            if ok:
+                tag = window_title(dev_path)
+                b = tag.encode("utf-8")
+                if len(b) > 255:
+                    b = b[:255]
+                header = struct.pack("!B", len(b)) + b
+                payload = pickle.dumps(buffer)
+                sock.sendto(header + payload, server_addr)
 
     cap.release()
 
