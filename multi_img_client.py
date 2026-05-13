@@ -22,11 +22,30 @@ WARMUP_READS = 15
 THREAD_START_DELAY_S = 0.25
 
 
+def get_screen_size():
+    """
+    Return primary monitor size as (width, height), or None if unavailable.
+    """
+    try:
+        import tkinter as tk
+
+        root = tk.Tk()
+        root.withdraw()
+        screen_w = root.winfo_screenwidth()
+        screen_h = root.winfo_screenheight()
+        root.destroy()
+        if screen_w > 0 and screen_h > 0:
+            return screen_w, screen_h
+    except Exception:
+        pass
+    return None
+
+
 def pick_frame_size(num_cameras):
     """Smaller frames when multiple UVC streams share USB bandwidth."""
     if num_cameras <= 1:
         return 640, 480
-    return 320, 240
+    return 640, 640
 
 
 def list_v4l2_device_nodes():
@@ -254,12 +273,20 @@ def main():
 
     last_shown = {}
     try:
+        screen_size = get_screen_size()
         for i, dev_path in enumerate(devices):
             title = window_title(dev_path)
             cv2.namedWindow(title, cv2.WINDOW_NORMAL)
             ph = placeholder_frame(width, height, "waiting " + title)
             cv2.imshow(title, ph)
-            cv2.moveWindow(title, i * (width + 40), 40)
+            if screen_size is not None:
+                screen_w, screen_h = screen_size
+                tile_w = max(320, screen_w // len(devices))
+                tile_h = max(240, screen_h // 2)
+                cv2.resizeWindow(title, tile_w, tile_h)
+                cv2.moveWindow(title, i * tile_w, 0)
+            else:
+                cv2.moveWindow(title, i * (width + 40), 40)
 
         while True:
             with lock:
